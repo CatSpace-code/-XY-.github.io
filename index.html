@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simulador de RA: Sistema Masa-Resorte</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Librerías de MediaPipe para visión artificial -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #0f172a; color: white; }
+        .canvas-container { position: relative; width: 100%; max-width: 640px; aspect-ratio: 4/3; margin: auto; overflow: hidden; border-radius: 0.75rem; border: 2px solid #334155; }
+        video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0.3; transform: scaleX(-1); /* Espejo */ }
+        canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform: scaleX(-1); }
+        .glass-panel { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(10px); }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col items-center p-6">
+
+    <header class="w-full max-w-4xl text-center mb-8">
+        <h1 class="text-3xl font-bold text-blue-400 mb-2">Mecánica Interactiva RA</h1>
+        <p class="text-slate-300">Controla la constante de elongación de un resorte usando tu mano (Visión Artificial)</p>
+    </header>
+
+    <main class="w-full max-w-4xl grid md:grid-cols-2 gap-6">
+        <!-- Panel del Simulador -->
+        <div class="glass-panel p-4 rounded-xl shadow-lg border border-slate-700 flex flex-col items-center">
+            <h2 class="text-xl font-semibold mb-4 text-emerald-400">Interfaz de Control (Webcam)</h2>
+            <div class="canvas-container bg-black shadow-inner">
+                <video id="input_video" autoplay playsinline></video>
+                <canvas id="output_canvas" width="640" height="480"></canvas>
+            </div>
+            <p class="mt-4 text-sm text-slate-400 text-center">
+                Mueve tu dedo índice frente a la cámara de arriba a abajo para aplicar fuerza al sistema masa-resorte.
+            </p>
+            <div id="loading" class="mt-4 px-4 py-2 bg-blue-600 rounded-full text-white text-sm animate-pulse">
+                Cargando modelo de IA...
+            </div>
+        </div>
+
+        <!-- Panel de Datos Técnicos -->
+        <div class="glass-panel p-6 rounded-xl shadow-lg border border-slate-700 flex flex-col justify-center">
+            <h2 class="text-xl font-semibold mb-6 text-purple-400">Variables Físicas en Tiempo Real</h2>
+            
+            <div class="space-y-6">
+                <div>
+                    <div class="flex justify-between mb-1">
+                        <span class="text-sm font-medium text-slate-300">Posición de la Mano (Y)</span>
+                        <span id="handPosVal" class="text-sm font-bold text-white">0.00 m</span>
+                    </div>
+                    <div class="w-full bg-slate-700 rounded-full h-2">
+                        <div id="handPosBar" class="bg-purple-500 h-2 rounded-full" style="width: 0%"></div>
+                    </div>
+                </div>
+
+                <div>
+                    <div class="flex justify-between mb-1">
+                        <span class="text-sm font-medium text-slate-300">Fuerza Aplicada (F)</span>
+                        <span id="forceVal" class="text-sm font-bold text-white">0.00 N</span>
+                    </div>
+                    <div class="w-full bg-slate-700 rounded-full h-2">
+                        <div id="forceBar" class="bg-emerald-500 h-2 rounded-full" style="width: 0%"></div>
+                    </div>
+                </div>
+
+                <div>
+                    <div class="flex justify-between mb-1">
+                        <span class="text-sm font-medium text-slate-300">Desplazamiento del Resorte (x)</span>
+                        <span id="springVal" class="text-sm font-bold text-white">0.00 m</span>
+                    </div>
+                    <div class="w-full bg-slate-700 rounded-full h-2">
+                        <div id="springBar" class="bg-blue-500 h-2 rounded-full" style="width: 0%"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="mt-8 p-4 bg-slate-800 rounded-lg border border-slate-600">
+                <h3 class="text-sm font-semibold text-slate-300 mb-2">Ecuación de Movimiento:</h3>
+                <p class="text-center font-mono text-emerald-300 text-lg">
+                    m·x'' + c·x' + k·x = F(t)
+                </p>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const loadingIndicator = document.getElementById('loading');
+
+        // Referencias a la UI
+        const handPosVal = document.getElementById('handPosVal');
+        const handPosBar = document.getElementById('handPosBar');
+        const forceVal = document.getElementById('forceVal');
+        const forceBar = document.getElementById('forceBar');
+        const springVal = document.getElementById('springVal');
+        const springBar = document.getElementById('springBar');
+
+        // Variables del sistema físico
+        const k = 50; // Constante del resorte (N/m)
+        let restY = 150; // Posición de reposo en pantalla
+        let currentMassY = restY;
+        let targetMassY = restY;
+
+        // Configuración de MediaPipe Hands
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.6,
+            minTrackingConfidence: 0.6
+        });
+
+        hands.onResults(onResults);
+
+        // Inicializar cámara
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+            },
+            width: 640,
+            height: 480
+        });
+        
+        camera.start().then(() => {
+            loadingIndicator.style.display = 'none';
+        }).catch(err => {
+            loadingIndicator.textContent = "Error al acceder a la cámara. Otorga permisos.";
+            loadingIndicator.classList.replace('bg-blue-600', 'bg-red-600');
+        });
+
+        function onResults(results) {
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            
+            let handY = 0;
+            
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                
+                // Dibujar puntos de la mano
+                drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#10b981', lineWidth: 3});
+                drawLandmarks(canvasCtx, landmarks, {color: '#3b82f6', lineWidth: 1, radius: 3});
+                
+                // Usar la punta del dedo índice (Landmark 8) para controlar
+                const indexFingerTip = landmarks[8];
+                handY = indexFingerTip.y * canvasElement.height;
+                
+                // Mapear la posición Y a una fuerza objetivo (suavizada)
+                targetMassY = Math.max(50, Math.min(handY, canvasElement.height - 50));
+                
+                // Actualizar UI
+                const handNormalized = (indexFingerTip.y * 100).toFixed(0);
+                handPosVal.innerText = `${(indexFingerTip.y).toFixed(2)} m`;
+                handPosBar.style.width = `${handNormalized}%`;
+            } else {
+                // Volver a posición de reposo si no hay mano
+                targetMassY = restY;
+                handPosVal.innerText = `0.00 m`;
+                handPosBar.style.width = `0%`;
+            }
+
+            // Simulación física básica (acercamiento progresivo tipo amortiguamiento)
+            currentMassY += (targetMassY - currentMassY) * 0.15;
+            
+            // Cálculos para UI
+            const displacement = (currentMassY - restY);
+            const force = (displacement * (k/100)).toFixed(2); // Escala para visualización
+            
+            forceVal.innerText = `${Math.abs(force)} N`;
+            forceBar.style.width = `${Math.min(Math.abs(force) * 2, 100)}%`;
+            
+            const dispMeters = (displacement / 100).toFixed(2);
+            springVal.innerText = `${Math.abs(dispMeters)} m`;
+            springBar.style.width = `${Math.min(Math.abs(dispMeters) * 50, 100)}%`;
+
+            // Dibujar el sistema mecánico
+            drawMechanicalSystem(canvasCtx, currentMassY);
+
+            canvasCtx.restore();
+        }
+
+        function drawMechanicalSystem(ctx, massY) {
+            const centerX = canvasElement.width / 2;
+            const topY = 20;
+            
+            // Techo fijo
+            ctx.fillStyle = '#64748b';
+            ctx.fillRect(centerX - 50, topY, 100, 10);
+            
+            // Resorte (zig-zag)
+            ctx.beginPath();
+            ctx.strokeStyle = '#94a3b8';
+            ctx.lineWidth = 4;
+            ctx.lineCap = 'round';
+            ctx.moveTo(centerX, topY + 10);
+            
+            const coils = 10;
+            const springLength = massY - topY - 30; 
+            const coilSpacing = springLength / coils;
+            
+            for (let i = 1; i <= coils; i++) {
+                const xOffset = (i % 2 === 0) ? -20 : 20;
+                ctx.lineTo(centerX + xOffset, topY + 10 + (i * coilSpacing) - (coilSpacing/2));
+            }
+            ctx.lineTo(centerX, massY - 20);
+            ctx.stroke();
+
+            // Masa
+            ctx.fillStyle = '#f59e0b';
+            ctx.shadowColor = 'rgba(0,0,0,0.5)';
+            ctx.shadowBlur = 10;
+            ctx.fillRect(centerX - 30, massY - 20, 60, 40);
+            
+            // Texto en la masa
+            ctx.fillStyle = 'black';
+            ctx.shadowBlur = 0;
+            ctx.font = 'bold 16px Arial';
+            ctx.textAlign = 'center';
+            ctx.fillText('M', centerX, massY + 6);
+        }
+    </script>
+</body>
+</html>
